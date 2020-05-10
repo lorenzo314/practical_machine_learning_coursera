@@ -1,0 +1,229 @@
+---
+title: "How well do people perform barbell lifts?"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Introduction
+
+We will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to quantify how well they do barbell lifts.
+The data comes http://groupware.les.inf.puc-rio.br/har.
+
+#### Loading libraries
+
+```{r include=TRUE}
+suppressMessages(library(caret))
+suppressMessages(library(plyr))
+suppressMessages(library(dplyr))
+suppressMessages(library(stringr))
+suppressMessages(library(randomForest))
+suppressMessages(library(gbm))
+suppressMessages(library(survival))
+suppressMessages(library(splines))
+suppressMessages(library(parallel))
+suppressMessages(library(MASS))
+```
+
+#### Initializing variables and downloading data
+
+```{r initialization}
+
+set.seed(4321)
+corr_thresh<-0.5
+cut<-3000
+kfold<-4
+training_link<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testing_link<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+training_file<-"pml-training.csv"
+testing_file<-"pml-testing.csv"
+download.file(training_link,training_file)
+download.file(testing_link,testing_file)
+training<-read.csv(training_file); n<-dim(training)[2]
+print(paste("Number of predictors", n-1))
+nms<-names(training);
+print(paste("Level",unique(training$classe)))
+```
+
+## Exploratory data analysis 
+
+The labels for the problem are `r unique(training$classe)[1]` (exercise well done)
+and  `r unique(training$classe)[2:5]` (execrcise done wrong).
+The number of predictors is high (`r n-1`).
+We must also check whether some predictors have missing values and whether some predictors are hihgly correlated with
+others.
+
+```{r missing values}
+miss<-rep(c(0),n)
+for (i in 1:n) {
+    q<-is.na(training[,i])==TRUE
+    na_frac<-length(training[,i][q])/length(training[,i])
+    miss[i]<-na_frac
+}
+print(round(unique(miss), digits = 2))
+```
+
+Some predictors do not have any missing value, but some have
+an unacceptably high proportion of them, `r (round(unique(miss)[2],digits=2))`, and must be excluded.
+Let us check what predictors are correlated; pairs of
+correlated predictors will not be used, as well as predictors with
+missing values.
+Predictors are considered correlated if their correlation coefficient is greater than `r corr_thresh`.
+Here's the list of predictors that do not have missing values and are not
+correlated with each other.
+
+```{r correlation}
+is_corr<-rep(FALSE, times = n)
+for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+        if (class(training[,i])=="numeric" & class(training[,j])=="numeric") {
+            c<-cor(training[,i],training[,j],use="pairwise.complete.obs")
+            if (abs(c)>corr_thresh) { is_corr[j]<-TRUE }
+        }
+    }
+}
+predictor_list <- ""; max_length<-70; aux<-0
+for (i in 1:n-1) {
+    if (isFALSE(is_corr[i])) {
+        q<-is.na(training[,i])==FALSE
+        na_frac<-length(training[,i][q])/length(training[,i])
+        if (na_frac==1) {
+            predictor_list<-paste0(predictor_list,nms[i])
+            aux<-aux+str_length(nms[i])
+            if (aux > max_length) {
+                predictor_list<-paste0(predictor_list,"\n")
+                aux<-0
+            } else {
+                predictor_list<-paste0(predictor_list,",");
+                aux<-aux+1
+            }
+        }
+    }
+}
+cat(predictor_list)
+```
+
+## Choosing the models and training them
+
+The list is still very long and using them all would be unacceptably slow; we select
+a subsample of them, as shown in the calls to the caret::train method below. 
+We try a random forest, a gradient boosted model, and a linear dicriminant analysis,
+with `r kfold`-fold cross validation.
+Given the long time it takes to train a random forest model on all the training dataset we randomly select `r cut` observations to speed up processing; here
+our aim is to check that the accuracy on the test dataset (where
+the test dataset is the dataset comprising the training dataset
+observations left out by cross validation) is stable across the
+`r kfold` iterations.
+Data are preprocessed by subtracting their mean and scaling them to
+unit variance.
+
+```{r Fit trials}
+get_acc<-function(trained_model,testing_data) {
+    pred<-predict(trained_model,newdata=testing_data)
+    ok<-pred[pred==testing_data$classe]
+    acc<-length(ok)/length(pred)
+}
+training_original<-read.csv("pml-training.csv")
+n_obs<-dim(training_original)[1]
+scramble<-sample(seq(1:n_obs))
+training_scrambled<-training_original[scramble,]
+training_scrambled<-training_scrambled[1:cut,]
+n_obs<-dim(training_scrambled)[1]
+validation_size<-round(n_obs/kfold)
+modRF<-vector(mode="list",length=kfold)
+modGBM<-vector(mode="list",length=kfold)
+modLDA<-vector(mode="list",length=kfold)
+for (i in 1:kfold) {
+    start_val<-(i-1)*validation_size+1
+    tmp<-i*validation_size
+    end_val<-ifelse(tmp>n_obs,n_obs,tmp)
+    in_validation_set<-c(start_val:end_val)
+    training<-training_scrambled[-in_validation_set,]
+    validation<-training_scrambled[in_validation_set,]
+    modRF[[i]]<-caret::train(
+        classe~accel_dumbbell_x+accel_dumbbell_y+accel_dumbbell_z+
+            accel_forearm_x+accel_forearm_y+accel_forearm_z+
+            magnet_dumbbell_x+magnet_dumbbell_y+magnet_dumbbell_z+
+            accel_arm_x+accel_arm_y+accel_arm_z+
+            magnet_arm_x+magnet_arm_y+magnet_arm_z+
+            roll_forearm+pitch_forearm+yaw_forearm+yaw_dumbbell,
+        data=training,method="rf",preProcess=c("center","scale"))
+    acc <- get_acc(modRF[[i]], validation)
+    print(paste("RF Model",i,round(acc,digits=3)))
+    modGBM[[i]]<-caret::train(
+        classe~accel_dumbbell_x+accel_dumbbell_y+accel_dumbbell_z+
+        accel_forearm_x+accel_forearm_y+accel_forearm_z+
+        magnet_dumbbell_x+magnet_dumbbell_y+magnet_dumbbell_z+
+        accel_arm_x+accel_arm_y+accel_arm_z+
+        magnet_arm_x+magnet_arm_y+magnet_arm_z+
+        roll_forearm+pitch_forearm+yaw_forearm+yaw_dumbbell,
+        method="gbm",verbose=FALSE,
+        data=training,preProcess=c("center","scale"))
+    acc <- get_acc(modGBM[[i]], validation)
+    print(paste("GBM Model",i,round(acc,digits=3)))
+    modLDA[[i]]<-caret::train(
+        classe~accel_dumbbell_x+accel_dumbbell_y+accel_dumbbell_z+
+        accel_forearm_x+accel_forearm_y+accel_forearm_z+
+        magnet_dumbbell_x+magnet_dumbbell_y+magnet_dumbbell_z+
+        accel_arm_x+accel_arm_y+accel_arm_z+
+        magnet_arm_x+magnet_arm_y+magnet_arm_z+
+        roll_forearm+pitch_forearm+yaw_forearm+yaw_dumbbell,
+        method="lda",data=training,preProcess=c("center","scale"))
+    acc <- get_acc(modLDA[[i]], validation)
+    print(paste("LDA Model",i,round(acc,digits=3)))
+}
+```
+
+## Choice of the final model
+
+The most important thing to note is that in all methods the
+accuracy is fairly stable across the `r kfold` iterations,
+suggesting that the chosen combination of predictors keeps
+the variance under control.
+The RF method performs the best: its accuracy ~ 0.9 so its out of
+sample error ia about 10%.
+The GBM is slightly worse (accuracy ~ 0.8, out of sample error ~20%)
+and the LDA is the worst of all.
+Therefore we will use the RF with this choice of predictors for
+the final analysis: below we train the method again, this time
+on the whole dataset, without cross validation.
+
+## Computing predictions for the test dataset
+
+We train the RF model with the chosen predictor on the full training sample;
+no cross validation
+
+```{r Final fit}
+training<-training_original[scramble,]
+modRF_final<-caret::train(
+    classe~accel_dumbbell_x+accel_dumbbell_y+accel_dumbbell_z+
+        accel_forearm_x+accel_forearm_y+accel_forearm_z+
+        magnet_dumbbell_x+magnet_dumbbell_y+magnet_dumbbell_z+
+        accel_arm_x+accel_arm_y+accel_arm_z+
+        magnet_arm_x+magnet_arm_y+magnet_arm_z+
+        roll_forearm+pitch_forearm+yaw_forearm+yaw_dumbbell,
+        data=training,method="rf",preProcess=c("center","scale"))
+```
+
+We can now use the resulting model for the testing dataset:
+
+```{r Reading test set}
+testing<-read.csv(testing_file); n<-dim(testing)[1]
+print(paste("Number of elements in test dataset", n))
+```
+
+composed of `r n` observations; results are shown below:
+
+```{r Predictions}
+final_pred<-predict(modRF_final, newdata=testing)
+final_pred_string<-""
+for (i in 1:(n/2)) {
+    final_pred_string<-paste0(final_pred_string,i,":",final_pred[i]," ")
+}
+final_pred_string<-paste0(final_pred_string,"\n")
+for (i in (n/2+1):n) {
+    final_pred_string<-paste0(final_pred_string,i,":",final_pred[i]," ")
+}
+final_pred_string<-paste0(final_pred_string,"\n")
+cat(final_pred_string)
+```
